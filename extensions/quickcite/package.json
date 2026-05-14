@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/raycast/schemas/main/package.json",
+  "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "quickcite",
   "title": "QuickCite",
   "description": "Convert URLs or DOIs to properly formatted MLA citations with metadata extraction",
