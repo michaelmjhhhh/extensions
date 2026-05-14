@@ -1,6 +1,6 @@
 # QuickCite Changelog
 
-## [Initial Release] - {PR_MERGE_DATE}
+## [Initial Version] - {PR_MERGE_DATE}
 
 - Convert URLs or DOIs to MLA citations
 - DOI metadata via Crossref and doi.org

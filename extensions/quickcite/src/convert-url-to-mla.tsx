@@ -25,6 +25,8 @@ const MONTHS = [
   "Dec.",
 ];
 const CROSSREF_WORKS_BASE_URL = "https://api.crossref.org/works";
+const FETCH_TIMEOUT_MS = 10000;
+const MAX_HTML_BYTES = 1_000_000;
 
 // Extract DOI from:
 // 1. 10.xxxx/xxxxx
@@ -40,10 +42,6 @@ interface CitationMetadata {
   publishedDate?: string;
   url?: string;
   accessDate?: Date;
-}
-
-interface FormValues {
-  url: string;
 }
 
 interface CitationResult {
@@ -121,11 +119,11 @@ export default function ConvertUrlToMla() {
   const [isLoading, setIsLoading] = useState(false);
   const inputKind = describeInputKind(input);
 
-  const handleConvert = async (values: FormValues) => {
-    const rawInput = values.url;
+  const handleConvert = async () => {
+    const rawInput = input;
 
     if (!rawInput.trim()) {
-      showToast({
+      await showToast({
         style: Toast.Style.Failure,
         title: "Input Required",
         message: "Please enter a URL or DOI",
@@ -138,14 +136,14 @@ export default function ConvertUrlToMla() {
     try {
       const nextResult = await generateCitationForInput(rawInput);
       setResult(nextResult);
-      showToast({
+      await showToast({
         style: Toast.Style.Success,
         title: "Citation Generated",
         message: `${nextResult.sourceType} metadata formatted as MLA`,
       });
     } catch (error) {
       setResult(null);
-      showToast({
+      await showToast({
         style: Toast.Style.Failure,
         title: "Could Not Generate Citation",
         message:
@@ -403,8 +401,7 @@ function buildMlaCitation(metadata: CitationMetadata): {
   htmlParts.push(escapeHtml(accessPart));
   mdParts.push(escapeMarkdown(accessPart));
 
-  const cleanUp = (s: string) =>
-    s.replace(/\s+/g, " ").replace(/\.\./g, ".").trim();
+  const cleanUp = (s: string) => s.replace(/\s+/g, " ").trim();
 
   return {
     text: cleanUp(textParts.join(" ")),
@@ -528,7 +525,7 @@ function describeInputKind(value: string): { title: string; text: string } {
 }
 
 function escapeMarkdown(value: string): string {
-  return value.replace(/([\\`*_{}[\]()#+\-.!|>])/g, "\\$1");
+  return value.replace(/([\\`*_[\]])/g, "\\$1");
 }
 
 /**
@@ -538,8 +535,8 @@ async function fetchCrossrefMetadata(
   doi: string,
 ): Promise<Partial<CitationMetadata> | null> {
   try {
-    const response = await fetch(
-      `${CROSSREF_WORKS_BASE_URL}/${encodeURIComponent(doi)}`,
+    const response = await fetchWithTimeout(
+      `${CROSSREF_WORKS_BASE_URL}/${formatDoiPath(doi)}`,
       {
         headers: {
           Accept: "application/json",
@@ -577,11 +574,14 @@ async function fetchDoiOrgMetadata(
   doi: string,
 ): Promise<Partial<CitationMetadata> | null> {
   try {
-    const response = await fetch(`https://doi.org/${encodeURIComponent(doi)}`, {
-      headers: {
-        Accept: "application/vnd.citationstyles.csl+json",
+    const response = await fetchWithTimeout(
+      `https://doi.org/${formatDoiPath(doi)}`,
+      {
+        headers: {
+          Accept: "application/vnd.citationstyles.csl+json",
+        },
       },
-    });
+    );
 
     if (!response.ok) return null;
 
@@ -609,7 +609,7 @@ async function fetchWebMetadata(
   url: string,
 ): Promise<Partial<CitationMetadata>> {
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       headers: {
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -619,8 +619,9 @@ async function fetchWebMetadata(
     });
 
     if (!response.ok) return {};
+    if (exceedsContentLength(response, MAX_HTML_BYTES)) return {};
 
-    const html = await response.text();
+    const html = (await response.text()).slice(0, MAX_HTML_BYTES);
     const jsonLd = extractJsonLdMetadata(html);
     const metaTags = extractMetaTagMetadata(html);
 
@@ -644,19 +645,11 @@ function extractMetaTagMetadata(html: string): Partial<CitationMetadata> {
       "dc.title",
       "DC.title",
     ]),
-    siteName: readMeta(html, [
-      "og:site_name",
-      "application-name",
-      "twitter:site",
-    ]),
-    author: readMeta(html, [
-      "author",
-      "article:author",
-      "citation_author",
-      "dc.creator",
-      "DC.creator",
-      "twitter:creator",
-    ]),
+    siteName: readMeta(html, ["og:site_name", "application-name"]),
+    author: firstNonUrlString(
+      readMeta(html, ["author", "citation_author", "dc.creator", "DC.creator"]),
+      readMeta(html, ["article:author", "twitter:creator"]),
+    ),
     publishedDate: readMeta(html, [
       "article:published_time",
       "article:modified_time",
@@ -752,7 +745,7 @@ function crossrefAuthorsToText(authors: CrossrefAuthor[] | undefined): string {
     .map((author) => {
       const given = cleanText(author.given || "");
       const family = cleanText(author.family || "");
-      const literal = cleanText(author.name || "");
+      const literal = cleanText(author.literal || author.name || "");
 
       if (given && family) return `${given} ${family}`;
       if (family) return family;
@@ -874,11 +867,15 @@ function formatPublicationDate(dateValue: string | undefined): string {
     return cleaned;
   }
 
-  return formatAccessDate(date);
+  return formatUtcDate(date);
 }
 
 function formatAccessDate(date: Date): string {
   return `${date.getDate()} ${MONTHS[date.getMonth()]} ${date.getFullYear()}`;
+}
+
+function formatUtcDate(date: Date): string {
+  return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;
 }
 
 function parseDateFlexible(value: string): Date | null {
@@ -947,12 +944,11 @@ function normalizeDoi(doi: string): string {
     .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
     .replace(/[)\].,;:!?]+$/g, "")
     .replace(/&.*$/g, "")
-    .toLowerCase()
     .trim();
 }
 
 function normalizeUrl(input: string): string {
-  const cleaned = cleanInput(input);
+  const cleaned = cleanText(input);
 
   if (isHttpUrl(cleaned)) {
     return cleaned;
@@ -986,7 +982,7 @@ function looksLikeBareDomain(value: string): boolean {
 }
 
 function cleanUrl(url: string | undefined): string {
-  const raw = cleanInput(url || "");
+  const raw = cleanText(url || "");
 
   if (!raw) return "";
 
@@ -1027,6 +1023,10 @@ function formatUrlForCitation(url: string | undefined): string {
     .replace(/^https?:\/\//i, "")
     .replace(/^www\./i, "")
     .replace(/\/$/, "");
+}
+
+function formatDoiPath(doi: string): string {
+  return doi.split("/").map(encodeURIComponent).join("/");
 }
 
 function hostnameFromUrl(url: string | undefined): string {
@@ -1090,15 +1090,58 @@ function readTitle(html: string): string {
   return match ? cleanTitle(decodeHtmlEntities(match[1])) : "";
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function exceedsContentLength(response: Response, maxBytes: number): boolean {
+  const contentLength = response.headers.get("content-length");
+  if (!contentLength) return false;
+
+  const parsed = Number.parseInt(contentLength, 10);
+  return Number.isFinite(parsed) && parsed > maxBytes;
+}
+
 function decodeHtmlEntities(value: string): string {
-  return value
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ");
+  const namedEntities: Record<string, string> = {
+    amp: "&",
+    quot: '"',
+    apos: "'",
+    lt: "<",
+    gt: ">",
+    nbsp: " ",
+    ndash: "-",
+    mdash: "-",
+    lsquo: "'",
+    rsquo: "'",
+    ldquo: '"',
+    rdquo: '"',
+    hellip: "...",
+  };
+
+  return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (entity, code: string) => {
+    if (code.startsWith("#x") || code.startsWith("#X")) {
+      const parsed = Number.parseInt(code.slice(2), 16);
+      return Number.isFinite(parsed) ? String.fromCodePoint(parsed) : entity;
+    }
+
+    if (code.startsWith("#")) {
+      const parsed = Number.parseInt(code.slice(1), 10);
+      return Number.isFinite(parsed) ? String.fromCodePoint(parsed) : entity;
+    }
+
+    return namedEntities[code.toLowerCase()] || entity;
+  });
 }
 
 /**
@@ -1166,6 +1209,10 @@ function cleanPersonName(name: string): string {
     .trim();
 }
 
+function firstNonUrlString(...values: string[]): string {
+  return values.find((value) => value && !isHttpUrl(value)) || "";
+}
+
 function withTerminalPunctuation(value: string): string {
   const cleaned = cleanText(value);
   if (!cleaned) return "";
@@ -1180,10 +1227,7 @@ function normalizeForCompare(value: string): string {
 }
 
 function hasUsefulDoiMetadata(metadata: Partial<CitationMetadata>): boolean {
-  return Boolean(
-    cleanText(metadata.title || "") &&
-    cleanText(metadata.siteName || metadata.author || ""),
-  );
+  return Boolean(cleanText(metadata.title || ""));
 }
 
 function mergeMetadataWithPriority(
