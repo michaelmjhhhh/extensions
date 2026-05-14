@@ -787,17 +787,30 @@ function jsonLdAuthorToText(
     return author
       .map((a) => {
         if (typeof a === "string") return cleanText(a);
-        return cleanText(a?.name || "");
+        return jsonLdAuthorName(a);
       })
       .filter(Boolean)
       .join(" and ");
   }
 
   if (typeof author === "object") {
-    return cleanText(author.name || "");
+    return jsonLdAuthorName(author);
   }
 
   return "";
+}
+
+function jsonLdAuthorName(author: JsonLdAuthor | undefined): string {
+  if (!author) return "";
+
+  return cleanText(
+    author.name ||
+      author.literal ||
+      [author.givenName, author.familyName]
+        .map(cleanText)
+        .filter(Boolean)
+        .join(" "),
+  );
 }
 
 function formatAuthor(author: string): string {
